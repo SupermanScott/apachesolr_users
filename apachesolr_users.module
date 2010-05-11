@@ -1,0 +1,303 @@
+<?php
+/**
+ * @file: provides methods for searching users on the Apache Solr framework
+ */
+
+/**
+ * Implementation of hook_apachesolr_document_handlers().
+ */
+function apachesolr_users_apachesolr_document_handlers($type, $namespace) {
+  if ($type == 'user' && $namespace == 'apachesolr_users') {
+    return array('apachesolr_users_user_to_document');
+  }
+}
+
+/**
+ * Implementation of hook_apachesolr_entites().
+ */
+function apachesolr_users_apachesolr_entities() {
+  return array(
+    'users' => 'User',
+  );
+}
+
+/**
+ * Implementation of hook_cron().
+ */
+function apachesolr_users_cron() {
+  module_load_include('inc', 'apachesolr', 'apachesolr.index');
+  $indexing_variables = variable_get('apachesolr_users_last_index', array('last_modify' => 0, 'last_uid' => 0));
+  // select me some users!
+  $users = db_query_range("SELECT uid, modified FROM {apachesolr_users_queue} WHERE status > 0 AND (modified > %d OR modified = %d AND uid > %d) ORDER BY modified ASC", $indexing_variables['last_modify'], $indexing_variables['last_modify'], $indexing_variables['last_uid'], 0, 100);
+  $docs = array();
+  $changed = array(); // all the uids changed
+  // Invoke hook_apachesolr_document_handlers to find out what modules build
+  // $documents from users.
+  $callbacks = array_filter(module_invoke_all('apachesolr_document_handlers', 'user', 'apachesolr_users'), 'function_exists');
+
+  while ($user_obj = db_fetch_object($users)) {
+    $account = user_load($user_obj->uid);
+    $changed[] = $user_obj->uid;
+    if (!empty($account->uid))  {
+      $indexing_variables['last_uid'] = $account->uid;
+      $indexing_variables['last_modify'] = $user_obj->modified;
+      foreach ($callbacks as $callback) {
+        // Callbacks can return a single document or an array of documents.
+        $document = $callback($account, 'apachesolr_users');
+
+        if (is_array($document)) {
+          $docs += $document;
+        }
+        else {
+          $docs[] = $document;
+        }
+      }
+    }
+  }
+  if (!empty($docs)) {
+    try{
+      // TODO: Explore setuping this up as a shutdown function
+      apachesolr_users_index_documents($docs);
+      variable_set('apachesolr_users_last_index', $indexing_variables);
+      return count($docs);
+    }
+    catch(Exception $e) {} // do nothing it has been recorded already to watchdog
+  }
+  if (!empty($changed)) {
+    db_query("UPDATE {apachesolr_users_queue} SET modified = %d WHERE uid IN (" . db_placeholders($changed) . ")", array($_SERVER['REQUEST_TIME']) + $changed);
+  }
+}
+
+/**
+ * turn an account into a document
+ *
+ * @param $account
+ * fully loaded user object
+ *
+ * @return document object representing an Apache Solr Document
+ */
+function apachesolr_users_user_to_document($account, $namespace) {
+  $document = new Apache_Solr_Document();
+  $document->entity = 'users';
+  $document->id = apachesolr_document_id($account->uid, 'user');
+  $document->site = url(NULL, array('absolute' => TRUE));
+  $document->hash = apachesolr_site_hash();
+  $document->url = url('user/' . $account->uid, array('absolute' => TRUE));
+  $document->title = "{$account->name}'s profile";
+  $document->uid = $account->uid;
+  $document->name = $account->name;
+  // status?
+  $document->status = $account->status;
+  $document->created = apachesolr_date_iso($account->created);
+  $document->changed = apachesolr_date_iso($account->modified);
+  $document->{apachesolr_index_key(array('index_type' => 'text', 'name' => 'mail'))} = $account->mail;
+  
+  $role_key = apachesolr_index_key(array('index_type' => 'integer', 'multiple' => TRUE, 'name' => 'rid'));
+  foreach ($account->roles as $rid => $name) {
+    $document->setMultiValue($role_key, $rid);
+  }
+  
+  // check for apachesolr nodeaccess
+  if (module_exists('apachesolr_nodeaccess')) {
+    // add in fake node access record
+    $document->setMultiValue('nodeaccess_all', 0);
+  }
+  
+  // Grab all the 'indexable' fields
+  module_invoke_all('user', 'index', array(), $account);
+  $text = drupal_render($account->content);
+  $document->body = apachesolr_clean_text($text);
+  
+  // allow other modules to throw stuff in
+  foreach (module_implements('apachesolr_user_index_alter') as $module) {
+    $function = $module . '_' . 'apachesolr_user_index_alter';
+    $function($document, $account);
+  }
+  // boost the html tags!
+  apachesolr_add_tags_to_document($document, $text);
+  
+  return $document;
+}
+
+/**
+ * takes a set of documents and puts them to Solr
+ *
+ * @param $documents
+ * array of documents to index on Solr
+ */
+function apachesolr_users_index_documents($documents) {
+  try {
+    $solr = apachesolr_get_solr();
+    if (!$solr->ping()) {
+      throw new Exception(t('No Solr instance avilable during indexing'));
+    }
+    
+    // here we have solr ready to go
+    $docs_sub_set = array_chunk($documents, 20);
+    foreach ($docs_sub_set as $docs) {
+      $solr->addDocuments($docs);
+    }
+    $solr->commit();
+    $solr->optimize(FALSE, FALSE);
+    
+    // save the variable so it could be used later
+  }
+  catch (Exception $e) {
+    watchdog('Apache Solr', $e->getMessage(), NULL, WATCHDOG_ERROR);
+    throw new Exception(t('Failed to Index'));
+  }
+}
+
+
+/**
+ * Implementation of hook_user().
+ */
+function apachesolr_users_user($op, &$edit, &$account, $category = NULL) {
+  if ($op == 'after_update') {
+    apachesolr_users_mark($account->uid, $account->status);
+  }
+  elseif ($op == 'insert') {
+    db_query("INSERT INTO {apachesolr_users_queue} (uid, status, modified) VALUES (%d, %d, %d)", $account->uid, $account->status, $account->created);
+  }
+  elseif ($op == 'delete') {
+    try {
+      $solr = apachesolr_get_solr();
+      $solr->deleteById(apachesolr_document_id($account->uid));
+    }
+    catch (Exception $e) {
+      watchdog('Apache Solr Users', nl2br(check_plain($e->getMessage())), NULL, WATCHDOG_ERROR);
+    }
+
+    db_query("DELETE FROM {apachesolr_users_queue} WHERE uid = %d", $account->uid);
+  }
+}
+
+/**
+ * Implementation of hook_form_FORM_ID_alter().
+ */
+function apachesolr_users_form_apachesolr_index_action_form_alter(&$form, $form_state) {
+  $form['action']['remaining_users'] = array(
+    '#title' => t('Indexed queued users'),
+    '#return_value' => 'remaining_users',
+    '#description' => t('Any users that are queued for indexing will be submitted to Solr immediately. Depending on the amount of users on the site, it may take a long time to complete, and may place an increased load on the server.'),
+    '#id' => form_clean_id('edit-' . implode('-', array('action', 'reindex_users'))),
+  ) + $form['action']['remaining'];
+
+  $form['submit']['#submit'][] = 'apachesolr_users_index_action_submit';
+}
+
+/**
+ * Implementation of hook_form_$form-id_alter().
+ */
+function apachesolr_users_form_apachesolr_clear_index_confirm_alter(&$form, $form_state) {
+  $form['#submit'][] = 'apachesolr_users_reindex';
+}
+
+/**
+ * Implementation of hook_form_$form-id_alter().
+ */
+function apachesolr_users_form_apachesolr_delete_index_confirm_alter(&$form, $form_state) {
+  $form['#submit'][] = 'apachesolr_users_reindex';
+}
+
+/**
+ * Submit handler for batch reindexing users.
+ */
+function apachesolr_users_index_action_submit($form, &$form_state) {
+  if ($form_state['values']['action'] == 'remaining_users') {
+    $batch = array(
+      'operations' => array(
+        array('apachesolr_users_batch_index', array()),
+      ),
+      //'finished' => 'apachesolr_users_batch_index_finished',
+      'title' => t('Indexing'),
+      'init_message' => t('Preparing to submit users to Solr for indexing...'),
+      'progress_message' => t('Submitting users to Solr...'),
+      'error_message' => t('Solr Users indexing has encountered an error.'),
+      'file' => drupal_get_path('module', 'apachesolr_users') . '/apachesolr_users.batch.inc',
+    );
+    batch_set($batch);
+  }
+}
+
+/**
+ * submit function to reindex users.
+ */
+function apachesolr_users_reindex(&$form, &$form_state) {
+  apachesolr_users_rebuild_index_table();
+}
+
+/**
+ * Deletes and rebuilds the apachesolr_users_queue table and resets the last
+ * index variable. This forces reindexing without talking to the Solr server.
+ */
+function apachesolr_users_rebuild_index_table() {
+  db_query("DELETE FROM {apachesolr_users_queue}");
+  db_query("INSERT INTO {apachesolr_users_queue} (uid, status, modified) SELECT u.uid, u.status, u.created FROM {users} u WHERE uid <> 0");
+
+  // Users created in the future get a modified time of now.
+  db_query("UPDATE {apachesolr_users_queue} SET modified = %d WHERE modified > %d", $_SERVER['REQUEST_TIME'], $_SERVER['REQUEST_TIME']);
+
+  apachesolr_users_clear_last_index();
+}
+
+/**
+ * Clears the last index values so indexing restarts from square 1.
+ */
+function apachesolr_users_clear_last_index() {
+  // @TODO: weird abstraction around a variable_del. Seems over-engineered.
+  variable_del('apachesolr_users_last_index');
+}
+
+/**
+ * mark a user for reindexing
+ *
+ * @param int $uid
+ * Users id
+ */
+function apachesolr_users_mark($uid, $status = 1) {
+  if (!empty($uid)) {
+    db_query("UPDATE {apachesolr_users_queue} SET modified = %d, status = %d WHERE uid = %d", $_SERVER['REQUEST_TIME'], $status, $uid);
+
+    if (empty($status)) {
+      apachesolr_users_delete_user_from_index($uid);
+    }
+  }
+}
+
+/**
+ * Delete a user from the index.
+ */
+function apachesolr_users_delete_user_from_index($uid) {
+  static $failed = FALSE;
+  if (empty($failed)) {
+    try {
+      $solr = apachesolr_get_solr();
+      $solr->deleteById(apachesolr_document_id($uid, 'user'));
+      return TRUE;
+    }
+    catch (Exception $e) {
+      watchdog('Apache Solr', nl2br(check_plain($e->getMessage())), NULL, WATCHDOG_ERROR);
+      // Don't keep trying queries if they are failing.
+      $failed = TRUE;
+      return FALSE;
+    }
+  }
+}
+
+/**
+ * Implemenation of hook_user_tags().
+ */
+function apachesolr_users_user_tags($uid, $tids) {
+  apachesolr_users_mark($uid);
+}
+
+/**
+ * Implementation of hook_views_api().
+ */
+function apachesolr_users_views_api() {
+  return array(
+    'api' => '2.0',
+    'path' => drupal_get_path('module', 'apachesolr_users') . '/views',
+  );
+}

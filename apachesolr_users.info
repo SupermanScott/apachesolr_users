@@ -1,0 +1,5 @@
+name = Apachesolr for users
+description = Provides indexing and searching on user profile fields
+dependencies[] = apachesolr
+package = Apache Solr
+core = "6.x"

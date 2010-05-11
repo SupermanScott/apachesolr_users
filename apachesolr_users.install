@@ -1,0 +1,66 @@
+<?php
+
+/**
+ * Implementation of hook_install()
+ */
+function apachesolr_users_install() {
+  drupal_install_schema('apachesolr_users');
+}
+
+/**
+ * Implementation of hook_schema
+ */
+function apachesolr_users_schema() {
+  $schema['apachesolr_users_queue'] = array(
+    'description' => t('Acts as a queue for the next users to be re-indexed'),
+    'fields' => array(
+      'uid' => array(
+        'description' => t('Primary Identifier of a user'),
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'modified' => array(
+        'description' => t('The Unix timestamp when the user was last changed'),
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'status' => array(
+        'description' => t('Boolean indicating whether the user is blocked.'),
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 1
+      ),
+    ),
+    'primary key' => array('uid'),
+    'indexes' => array(
+      'changed' => array('modified', 'status'),
+    ),
+  );
+  return $schema;
+}
+
+/**
+ * Implementation of hook_enable().
+ */
+function apachesolr_users_enable() {
+  apachesolr_users_rebuild_index_table();
+}
+
+/**
+ * Implementation of hook_update_N().
+ */
+function apachesolr_users_update_6001() {
+  $ret = array();
+  $field = array(
+    'description' => t('Boolean indicating whether the user is blocked.'),
+    'type' => 'int',
+    'not null' => TRUE,
+    'default' => 1
+  );
+  db_add_field($ret, 'apachesolr_users_queue', 'status', $field, array('indexes' => array('changed' => array('modified', 'status'))));
+  apachesolr_users_rebuild_index_table();
+
+  return $ret;
+}
